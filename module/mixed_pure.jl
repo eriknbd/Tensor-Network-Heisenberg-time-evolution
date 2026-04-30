@@ -158,10 +158,50 @@ function PF_gate(hj, sites, τ::Real; order::Int = 2)
   end
 end
 
-function step!(ψ, gate; cutoff=1e-8, maxdim=nothing)
-  ψ = apply(gate, ψ; cutoff=cutoff, maxdim=maxdim)
-  normalize!(ψ)
-  return ψ
+function _is_interleaved_purified_layout(psi::MPS, sitesP)
+    N = length(sitesP)
+    length(psi) == 2N || return false
+    for i in 1:N
+        hasind(psi[2i - 1], sitesP[i]) || return false
+    end
+    return true
+end
+
+function even_odd_Hamiltonian_interleaved(hj, sitesP, sitesPA)
+    N = length(sitesP)
+    odd_bonds = 1:2:(N - 1)
+    even_bonds = 2:2:(N - 1)
+    H_even = [hj(j, sitesP) * op("Id", sitesPA[2j]) for j in even_bonds]
+    H_odd = [hj(j, sitesP) * op("Id", sitesPA[2j]) for j in odd_bonds]
+    return H_even, H_odd
+end
+
+function time_operators_even_odd_interleaved(hj, sitesP, sitesPA)
+    H_even, H_odd = even_odd_Hamiltonian_interleaved(hj, sitesP, sitesPA)
+    U_even(tau) = exp.(-im * tau * H_even)
+    U_odd(tau) = exp.(-im * tau * H_odd)
+    return U_even, U_odd
+end
+
+function PF_gate_interleaved(hj, sitesP, sitesPA, τ::Real; order::Int = 2)
+    U_even, U_odd = time_operators_even_odd_interleaved(hj, sitesP, sitesPA)
+    if order == 1
+        return PF1_gate(U_even, U_odd, τ)
+    elseif order == 2
+        return PF2_gate(U_even, U_odd, τ)
+    elseif order == 3
+        return PF3_gate(U_even, U_odd, τ)
+    else
+        throw(ArgumentError("Order must be 1, 2, or 3."))
+    end
+end
+
+function step!(ψ::MPS, gate; cutoff=1e-10, normalize::Bool=true)
+    ψ = apply(gate, ψ; cutoff=cutoff)
+    if normalize
+        normalize!(ψ)
+    end
+    return ψ
 end
 
 # ========================================= #
@@ -169,15 +209,21 @@ end
 # ========================================= #
 
 
-function Entropy_Bipartition(psi::MPS, b)  
-  psi = orthogonalize(psi, b)
-  U,S,V = svd(psi[b], (linkinds(psi, b-1)..., siteinds(psi, b)...))
-  SvN = 0.0
-  for n=1:dim(S, 1)
-    p = S[n,n]^2
-    SvN -= p * log(p)
-  end
-  return SvN
+function Entropy_Bipartition(psi::MPS, b::Int; base=2, tol=1e-20)
+    orthogonalize!(psi, b)
+    left_inds = b == 1 ?
+        Tuple(siteinds(psi, b)) :
+        tuple(linkind(psi, b - 1), siteinds(psi, b)...)
+    _, S, _ = svd(psi[b], left_inds)
+    logfun = base == 2 ? log2 : log
+    SvN = 0.0
+    for n in 1:dim(S, 1)
+        p = abs2(S[n, n])
+        if p > tol
+            SvN -= p * logfun(p)
+        end
+    end
+    return SvN
 end
 
 function _mps_distance(ψ::MPS, ϕ::MPS)
@@ -191,80 +237,143 @@ function _mps_distance(ψ::MPS, ϕ::MPS)
 end
 
 function mps_distance(ψv, ϕv)
-    n = size(ψv)[1]
+    n = length(ψv)
     return [_mps_distance(ψv[i], ϕv[i]) for i in 1:n]
 end
 
-function MPS_evo(s, psi, t_Vec, r; h::Vector = [nothing], per::Bool = false,
-                 cutoff::Real = 1e-10, showprogress::Bool = true)
+function MPS_evo(
+    s,
+    psi,
+    t_Vec,
+    r;
+    h::Union{Nothing,AbstractVector}=nothing,
+    per::Bool=false,
+    cutoff::Real=1e-10,
+    showprogress::Bool=true,
+    store_states::Bool=false,
+    snapshot_every::Int=0,
+    sz_every::Int=1,
+    entropy_every::Int=1,
+    normalize_every::Int=1,
+    trotter_order::Int=1,
+)
+    snapshot_every < 0 && throw(ArgumentError("snapshot_every must be >= 0"))
+    sz_every < 1 && throw(ArgumentError("sz_every must be >= 1"))
+    entropy_every < 1 && throw(ArgumentError("entropy_every must be >= 1"))
+    normalize_every < 1 && throw(ArgumentError("normalize_every must be >= 1"))
 
-    # Here s = sitesP, so N is the number of PHYSICAL sites
     N = length(s)
     c = div(N, 2)
+    nt = length(t_Vec)
     tau = (t_Vec[end] - t_Vec[1]) / r
 
-    if all(==(nothing), h)
+    if h === nothing || all(isnothing, h)
         f_hamiltonian = heis_hj_no_h(; per = per)
     else
         f_hamiltonian = heis_rf_for_h(h; per = per)
     end
 
-    # Build gates only on the physical indices
-    gate = PF_gate(f_hamiltonian, s, tau; order = 1)
+    use_local_gate_engine = !per && _is_interleaved_purified_layout(psi, s)
+    gate = if use_local_gate_engine
+        sitesPA = [siteind(psi, n) for n in 1:length(psi)]
+        PF_gate_interleaved(f_hamiltonian, s, sitesPA, tau; order = trotter_order)
+    else
+        PF_gate(f_hamiltonian, s, tau; order = trotter_order)
+    end
 
-    # Physical sites in the interleaved purified MPS:
-    # (P1,A1,P2,A2,...) -> physical positions = 1,3,5,...
-    phys_pos = collect(1:2:(2N - 1))
+    if length(psi) == 2N
+        phys_pos = 1:2:(2N - 1)
+        cut_pos = 2c
+    else
+        phys_pos = 1:N
+        cut_pos = c
+    end
 
-    # Cut after the c-th purified pair: (P1,A1,...,Pc,Ac) | (P(c+1),A(c+1),...)
-    cut_pos = 2c
+    Sz_all = Matrix{Float64}(undef, nt, N)
+    S_Bi = Vector{Float64}(undef, nt)
+    fill!(Sz_all, NaN)
+    fill!(S_Bi, NaN)
 
-    # --- storage ---
-    Sz_all = Matrix{Float64}(undef, r+1, N)
-    S_Bi   = Vector{Float64}(undef, r+1)
-
-    psi_t = psi
+    psi_t = deepcopy(psi)
     psi_vec = MPS[]
+    stored_steps = Int[]
 
-    p = showprogress ? Progress(length(t_Vec); desc="MPS evo (r=$r)", dt=0.2) : nothing
+    p = showprogress ? Progress(nt; desc="MPS evo (r=$r)", dt=0.2) : nothing
 
-    for (i, t) in enumerate(t_Vec)
-
-        push!(psi_vec, deepcopy(psi_t))
-
-        # Measure only physical spins
-        Sz_all[i, :] = expect(psi_t, "Sz"; sites=phys_pos)
-
-        # Entropy across the central purified cut
-        S_Bi[i] = Entropy_Bipartition(psi_t, cut_pos)
-
-        if i == r+1
-            showprogress && next!(p)
-            break
+    for i in 1:nt
+        if store_states && snapshot_every > 0
+            do_snapshot = (i == 1) || (i == nt) || ((i - 1) % snapshot_every == 0)
+            if do_snapshot
+                push!(psi_vec, deepcopy(psi_t))
+                push!(stored_steps, i)
+            end
         end
 
-        psi_t = step!(psi_t, gate; cutoff=cutoff)
+        do_sz = (i == 1) || (i == nt) || (sz_every == 1) || (i % sz_every == 0)
+        if do_sz
+            Sz_all[i, :] = real.(expect(psi_t, "Sz"; sites = phys_pos))
+        end
+
+        do_entropy = (i == 1) || (i == nt) || (entropy_every == 1) || (i % entropy_every == 0)
+        if do_entropy
+            S_Bi[i] = Entropy_Bipartition(psi_t, cut_pos)
+        end
+
+        if i < nt
+            do_normalize = (normalize_every == 1) || (i % normalize_every == 0) || (i == nt - 1)
+            psi_t = step!(psi_t, gate; cutoff = cutoff, normalize = do_normalize)
+        end
         showprogress && next!(p)
     end
 
-    return [psi_vec, Sz_all, S_Bi]
+    return (psi_vec, Sz_all, S_Bi, stored_steps)
 end
 
 
-function Diff_trotter_r(s, psi,  t,  rv::Vector; h::Vector = [nothing], per:: Bool = false,  
-                        cutoff::Real = 1e-10, doprint::Bool = true, showprogress::Bool = false)
-    N = length(s) 
+function Diff_trotter_r(
+    s,
+    psi,
+    t,
+    rv::Vector;
+    h::Union{Nothing,AbstractVector}=nothing,
+    per::Bool=false,
+    cutoff::Real=1e-10,
+    doprint::Bool=true,
+    showprogress::Bool=false,
+    store_states::Bool=false,
+    snapshot_every::Int=0,
+    sz_every::Int=1,
+    entropy_every::Int=1,
+    normalize_every::Int=1,
+    trotter_order::Int=1,
+)
+    N = length(s)
 
-    All_Full_evos = []
+    TOut = Tuple{Vector{MPS}, Matrix{Float64}, Vector{Float64}, Vector{Int}}
+    All_Full_evos = Vector{TOut}(undef, length(rv))
 
-    for r in rv
-        tau = t/r
-        ts = collect(0.0:tau:t)
-        if doprint == true 
+    for (ir, r) in enumerate(rv)
+        tau = t / r
+        ts = collect(range(0.0, t; length = r + 1))
+        if doprint
             print_simulation_parameters(N, tau, cutoff, t, r)
         end
-        evopars = MPS_evo(s, psi, ts, r; h, per = per, showprogress = showprogress)
-        push!(All_Full_evos, evopars)
+        All_Full_evos[ir] = MPS_evo(
+            s,
+            psi,
+            ts,
+            r;
+            h=h,
+            per=per,
+            cutoff=cutoff,
+            showprogress=showprogress,
+            store_states=store_states,
+            snapshot_every=snapshot_every,
+            sz_every=sz_every,
+            entropy_every=entropy_every,
+            normalize_every=normalize_every,
+            trotter_order=trotter_order,
+        )
     end
     return All_Full_evos
 end
@@ -285,10 +394,14 @@ function plot_spin_dynamics(ts, Sz_all, S_Bi, n, N, tau; gifname = "spins_bars.g
     # Stride = 1 / (tau * fps)
     every = max(1, round(Int, 1 / (tau * fps)))
 
-    sz_maximum = maximum(Sz_all)*1.15
+    valid_sz = Sz_all[.!isnan.(Sz_all)]
+    sz_maximum = isempty(valid_sz) ? 1.0 : maximum(abs.(valid_sz)) * 1.15
+    valid_rows = findall(i -> all(!isnan, Sz_all[i, :]), 1:size(Sz_all, 1))
+    isempty(valid_rows) && error("No valid Sz samples to plot. Increase measurement frequency (sz_every).")
+    plot_rows = valid_rows[1:every:end]
 
     # --- Animación ---
-    anim = @animate for i in 1:every:size(Sz_all, 1)
+    anim = @animate for i in plot_rows
         bar(1:N, Sz_all[i, :];
             ylim = (-sz_maximum, sz_maximum),
             xlabel = "site j",
@@ -303,14 +416,16 @@ function plot_spin_dynamics(ts, Sz_all, S_Bi, n, N, tau; gifname = "spins_bars.g
     Sz_animation = gif(anim, gifname, fps = fps)
 
     # --- Gráficas estáticas (sin cambios de tamaño) ---
-    Szc_plot = plot(ts, Sz_all[:, n];
+    sz_mask = .!isnan.(Sz_all[:, n])
+    Szc_plot = plot(ts[sz_mask], Sz_all[sz_mask, n];
         xlabel = "t",
         ylabel = "⟨Sᶻ_$n⟩",
         legend = false,
         title = "Site j = $n",
     )
 
-    SvN_plot = plot(ts, S_Bi;
+    entropy_mask = .!isnan.(S_Bi)
+    SvN_plot = plot(ts[entropy_mask], S_Bi[entropy_mask];
         xlabel = "t",
         ylabel = "Entanglement entropy",
         legend = false,
@@ -327,38 +442,64 @@ function plot_diff(All_evos, t; plot_diffs::Bool = true)
     L = length(All_evos)
     N = size(All_evos[1][2], 2)
     c = div(N, 2)
+    has_states = all(ev -> !isempty(ev[1]), All_evos)
 
     tvv = [
-        collect(range(0, t, length = length(All_evos[i][1]))) for i in 1:(L)
+        collect(range(0, t, length = size(All_evos[i][2], 1))) for i in 1:L
     ]
 
-    idv = []
+    idv = Vector{Vector{Int}}(undef, L)
     for i in 1:(L-1)
-        id   = round.(Int, range(1, length(All_evos[L][1]),  length=length(All_evos[i][1])))
-        push!(idv, id)
+        idv[i] = round.(Int, range(1, size(All_evos[L][2], 1), length=size(All_evos[i][2], 1)))
     end
-    push!(idv, collect(eachindex(All_evos[L][1])))
+    idv[L] = collect(1:size(All_evos[L][2], 1))
 
     MPSv_all = [evos[1] for evos in All_evos]
     Szv_all  = [evos[2] for evos in All_evos]
     Sc_all   = [evos[3] for evos in All_evos]
+    stored_steps_all = [length(evos) >= 4 ? evos[4] : collect(1:length(evos[1])) for evos in All_evos]
 
-    dist_MPS = []
-    diff_Szv = []
-    diff_Sc  = []
+    dist_MPS = has_states ? Vector{Vector{Float64}}(undef, L-1) : Vector{Vector{Float64}}()
+    dist_tv  = has_states ? Vector{Vector{Float64}}(undef, L-1) : Vector{Vector{Float64}}()
+    diff_Szv = Vector{Matrix{Float64}}(undef, L-1)
+    diff_Sc  = Vector{Vector{Float64}}(undef, L-1)
+    ref_state_by_step = Dict{Int,MPS}()
+
+    if has_states
+        for (k, step) in enumerate(stored_steps_all[L])
+            ref_state_by_step[step] = MPSv_all[L][k]
+        end
+    end
 
     for i in 1:(L-1)
-        dmps = mps_distance(MPSv_all[i], MPSv_all[L][idv[i]])
-        push!(dist_MPS, dmps)
+        if has_states
+            psi_i = MPS[]
+            psi_ref = MPS[]
+            times_i = Float64[]
+            for (k, step_i) in enumerate(stored_steps_all[i])
+                mapped_ref_step = idv[i][step_i]
+                if haskey(ref_state_by_step, mapped_ref_step)
+                    push!(psi_i, MPSv_all[i][k])
+                    push!(psi_ref, ref_state_by_step[mapped_ref_step])
+                    push!(times_i, tvv[i][step_i])
+                end
+            end
+            if isempty(psi_i)
+                dist_MPS[i] = Float64[]
+                dist_tv[i] = Float64[]
+            else
+                dist_MPS[i] = mps_distance(psi_i, psi_ref)
+                dist_tv[i] = times_i
+            end
+        end
 
-        dSz  =  Szv_all[i] - Szv_all[L][idv[i], :]
-        push!(diff_Szv, dSz)
+        diff_Szv[i] = Szv_all[i] - Szv_all[L][idv[i], :]
 
-        dSc  =  Sc_all[i] - Sc_all[L][idv[i]]
-        push!(diff_Sc, dSc)
+        diff_Sc[i] = Sc_all[i] - Sc_all[L][idv[i]]
     end
-    diff_Szv_c = [Szv[: , c] for Szv in diff_Szv]
+    diff_Szv_c = [Szv[:, c] for Szv in diff_Szv]
 
+    p = nothing
     if plot_diffs
         
         default(; lw=2, framestyle=:box, grid=true,
@@ -380,23 +521,27 @@ function plot_diff(All_evos, t; plot_diffs::Bool = true)
         p3 = plot(; xlabel="t", ylabel="∥ψ−ϕ∥", title="States distance (2 - 2ℜ⟨ψ∣ϕ⟩)^1/2",
                 legend=:topright, xlims=(0, t))
 
-        # Curvas
         for i in 1:(L-1)
             plot!(p1, tvv[i], diff_Szv_c[i])
             plot!(p2, tvv[i], diff_Sc[i])
-            plot!(p3, tvv[i], dist_MPS[i]; label=labels[i])
+            if has_states && !isempty(dist_MPS[i])
+                plot!(p3, dist_tv[i], dist_MPS[i]; label=labels[i])
+            end
         end
 
-        # Layout: dos arriba, una abajo
+        if !has_states || all(isempty, dist_MPS)
+            annotate!(p3, t / 2, 0.0, text("State distance unavailable (no matching snapshots)", 9))
+        end
+
         ptop = plot(p1, p2; layout=(1,2))
         p    = plot(ptop, p3; layout=(2,1), heights=[0.55, 0.45], size=(1200, 700))
 
     end
-    return [dist_MPS, diff_Szv, diff_Sc, p]
+    return (dist_MPS, diff_Szv, diff_Sc, p)
 end
 
 function complete_plots(N, t, tau, evos; save_at = "Plots/complete_plot")
-    ts = collect(range(0, t, step = tau))
+    ts = collect(range(0, t, length = size(evos[end][2], 1)))
     c  = div(N,2)
 
     Sz_all = evos[end][2]
@@ -406,14 +551,17 @@ function complete_plots(N, t, tau, evos; save_at = "Plots/complete_plot")
     combined, anim = plot_spin_dynamics(ts, Sz_all, S_Bi, c, N, tau, gifname = save_at * "evo.gif")
     savefig(combined, save_at * "combined.png")
 
-    print("asdasd")
-
-    d_plt = plot_diff(All_evos, t; plot_diffs = true)[end]
-    savefig(d_plt, save_at * "differences.png")
+    d_plt = nothing
+    if length(evos) != 1
+        d_plt = plot_diff(evos, t; plot_diffs = true)[end]
+        savefig(d_plt, save_at * "differences.png")
+    end
 
     display(combined)
     display(anim)
-    display(d_plt)
+    if d_plt !== nothing
+        display(d_plt)
+    end
 end
 
 

@@ -131,7 +131,7 @@ function local_expect_mpo(ρ::MPO, opname::String = "Sz"; normalize::Bool = true
     # Trace tensors for each site: contract local bra/ket legs with identity
     Ttr = Vector{ITensor}(undef, N)
     for j in 1:N
-        Ttr[j] = ρ[j] * delta(s[j], sp[j])  # test tr(ρ[j])
+        Ttr[j] = ρ[j] * delta(dag(s[j]), dag(sp[j]))  # test tr(ρ[j])
     end
 
     # Right: R[N] = Ttr[N], R[N-1] = Ttr[N-1] * Ttr[N], R[1] = Ttr[1] * Ttr[2] * ... * Ttr[N] = Tr(ρ)
@@ -191,7 +191,7 @@ function partial_trace(rho::MPO, trsites::UnitRange{Int})
     for k in i:j
         s  = siteind(rho, k; plev=0)
         sp = siteind(rho, k; plev=1)
-        E *= rho[k] * delta(s, sp)
+        E *= rho[k] * delta(dag(s), dag(sp))
     end
 
 
@@ -319,7 +319,7 @@ PF3_gate(U_a, U_b, τ::Real) = vcat(
     U_a((-1/24)*τ), U_b(τ),
 )
 
-function PF_gate(hj, sites, τ::Real; order::Int = 2)
+function PF_gate(hj, sites, τ::Real; order::Int = 1)
     U_even, U_odd = time_operators_even_odd(hj, sites)
     
     if     order == 1
