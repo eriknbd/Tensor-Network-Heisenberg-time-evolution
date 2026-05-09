@@ -334,6 +334,68 @@ function PF_gate(hj, sites, τ::Real; order::Int = 1)
 end
 
 
+function _bond_endpoint(r::Int, N::Int; per::Bool = false)
+    if 1 <= r < N
+        return r + 1
+    elseif r == N && per
+        return 1
+    end
+    throw(ArgumentError("bond index r=$r is outside the open chain 1:$(N - 1)"))
+end
+
+
+function discrete_odd_spin_current_density(r::Int, sites, J::Real; per::Bool = false)
+    N = length(sites)
+    rp = _bond_endpoint(r, N; per = per)
+    sr, srp = sites[r], sites[rp]
+
+    jr = (op("S-", sr) * op("S+", srp) - op("S+", sr) * op("S-", srp)) / (2im)
+    dz = op("Id", sr) * op("Sz", srp) - op("Sz", sr) * op("Id", srp)
+
+    return 2sin(J) * jr - 0.5sin(J / 2)^2 * dz
+end
+
+function discrete_odd_spin_current_density_mpo(r::Int, sites, J::Real; per::Bool = false)
+    N = length(sites)
+    rp = _bond_endpoint(r, N; per = per)
+
+    os = OpSum()
+    os += sin(J) / im, "S-", r, "S+", rp
+    os += -sin(J) / im, "S+", r, "S-", rp
+    os += 0.5sin(J / 2)^2, "Sz", r
+    os += -0.5sin(J / 2)^2, "Sz", rp
+
+    return MPO(os, sites)
+end
+
+
+function discrete_spin_current_density_operators(
+    sites,
+    J::Real,
+    Ue_gates;
+    bonds = nothing,
+    per::Bool = false,
+    cutoff = 1e-10,
+    maxdim = nothing,
+)
+    N = length(sites)
+    selected_bonds = bonds === nothing ? (per ? collect(1:N) : collect(1:(N - 1))) : collect(bonds)
+
+    j_odd = [
+        discrete_odd_spin_current_density_mpo(r, sites, J; per = per)
+        for r in selected_bonds
+    ]
+
+    Ue_dag = swapprime.(dag.(Ue_gates),0,1)
+    j_even = [
+        apply(Ue_dag, jr; cutoff = cutoff, maxdim = maxdim, apply_dag = true)
+        for jr in j_odd
+    ]
+
+    return (odd = j_odd, even = j_even, bonds = selected_bonds)
+end
+
+
 function step(psi::MPS, gate; cutoff=1e-10, maxdim=nothing, hermitianize::Bool = false, normalize::Bool = true)
     psi = apply(gate, psi; cutoff=cutoff, maxdim=maxdim)
     if normalize
@@ -511,6 +573,60 @@ function state_evo(
 
     return (psi_vec, Sz_all, S_Bi)
 end
+
+
+function complete_state_evo(
+    s,
+    psi,
+    t_Vec,
+    r;
+    h::Union{Nothing,AbstractVector}=nothing,
+    per::Bool=false,
+    cutoff::Real=1e-10,
+    showprogress::Bool=true,
+    hermitianize::Bool=false,
+    normalize_every::Int=1,
+)
+
+    normalize_every < 1 && throw(ArgumentError("normalize_every must be >= 1"))
+
+    tau =  (t_Vec[end] - t_Vec[1]) / r
+
+    if h === nothing || all(isnothing, h)
+        f_hamiltonian = heis_hj_no_h(; per = per)
+    else
+        f_hamiltonian = heis_rf_for_h(h; per = per)
+    end
+
+    gate = PF_gate(f_hamiltonian, s, tau; order = 1)
+
+    nt = length(t_Vec)
+    psi_vec = Vector{typeof(psi)}(undef, nt)
+    psi_t = deepcopy(psi)
+
+    p = showprogress ? Progress(nt; desc="Full state evo (r=$r)", dt=0.2) : nothing
+
+    for i in 1:nt
+        psi_vec[i] = copy(psi_t)
+
+        if i < nt
+            do_normalize = (normalize_every == 1) || (i % normalize_every == 0) || (i == nt - 1)
+            do_hermitianize = hermitianize && do_normalize
+            psi_t = step(
+                psi_t,
+                gate;
+                cutoff=cutoff,
+                hermitianize=do_hermitianize,
+                normalize=do_normalize,
+            )
+        end
+
+        showprogress && next!(p)
+    end
+
+    return psi_vec
+end
+
 
 function Diff_trotter_r(
     s,
