@@ -4,6 +4,7 @@ using Printf
 using Plots
 using LaTeXStrings
 using ProgressMeter
+using HDF5
 
 # ========================================= #
 # ============== MPS utilities ============ #
@@ -35,7 +36,7 @@ function Entropy_Bipartition(psi::MPS, b::Int; base = 2, tol = 1e-20)
 
     _, S, _ = svd(ψ[b], left_inds)
     logfun = base == 2 ? log2 : log
-    
+
     SvN = 0.0
     for n in 1:dim(S, 1)
         p = abs2(S[n, n])  # Safe, fast squaring
@@ -43,7 +44,7 @@ function Entropy_Bipartition(psi::MPS, b::Int; base = 2, tol = 1e-20)
             SvN -= p * logfun(p)
         end
     end
-    
+
     return SvN
 end
 
@@ -64,9 +65,28 @@ _normalize!(psi:: MPS) = normalize!(psi)
 function _normalize!(ρ::MPO)
     Z = tr(ρ)
     iszero(Z) && error("No se puede normalizar un MPO con traza cero.")
-    ρ /= Z
+
+    if !(isfinite(real(Z)) && isfinite(imag(Z)))
+        error("La traza no es finita: tr(ρ) = $Z")
+    end
+
+    N = length(ρ)
+    absZ = abs(Z)
+    phase = Z / absZ
+
+    # Distribute absZ over all tensors
+    λ = exp(log(absZ) / N)
+
+    for j in 1:N
+        ρ[j] /= λ
+    end
+
+    ρ[1] /= phase
+
     return ρ
 end
+
+
 
 # ========================================= #
 # ============= MPO functions ============= #
@@ -103,9 +123,12 @@ function initial_rho_mu(L::Int, μ::Real; normalize=true, conserve_qns=true)
 
     # 5) Normalización opcional: Tr(ρ)=1
     if normalize
-        Z = (2 * cosh(μ / 2))^L
-        ρ = ρ / Z
+        zloc = 2 * cosh(μ / 2)
+        for j in 1:L
+            ρ[j] /= zloc
+        end
     end
+    isinf(tr(ρ)) && error("Dimensions are too large to compute the trace, tr(rho) -> inf. Use normalize = true.")
 
     return ρ, sites
 end
@@ -241,7 +264,7 @@ function second_Renyi_entropy(rho::MPO, c::Int; base = 2)
     rhoA = partial_trace(rho, (c+1), N)
 
     TrA = tr(rhoA)
-    
+
     logTr_rhoA2 = loginner(swapprime(dag(rhoA), 0 => 1), rhoA)
     
     if base == 2
@@ -274,15 +297,23 @@ function hermitianize!(rho::MPO; cutoff=1e-10, normalize::Bool = false)
     return rho
 end
 
+function _gauge_normalize!(ρ::MPO)
+    normalize!(ρ)
+    return ρ
+end
+
 # ========================================= #
 # ================= Gates ================= #
 # ========================================= #
 
-function even_odd_Hamiltonian(hj, sites)
+function even_odd_bonds(N::Int; per::Bool = false)
+    last_bond = per ? N : N - 1
+    return collect(2:2:last_bond), collect(1:2:last_bond)
+end
+
+function even_odd_Hamiltonian(hj, sites; per::Bool = false)
     N = length(sites)
-    # Split bonds into odd and even sets:
-    odd_bonds  = 1:2:N
-    even_bonds = 2:2:N
+    even_bonds, odd_bonds = even_odd_bonds(N; per = per)
     H_even = [hj(j, sites) for j in even_bonds]
     H_odd  = [hj(j, sites) for j in  odd_bonds]
     H_even, H_odd   # Tuple{Vector{ITensor}, Vector{ITensor}}
@@ -303,8 +334,8 @@ function time_operator(H)
   end
 end  # Tuple{anonymous function{Vector{ITensor}}, anonymous function{Vector{ITensor}}}
 
-function time_operators_even_odd(hj, sites)
-    H_even, H_odd = even_odd_Hamiltonian(hj, sites)
+function time_operators_even_odd(hj, sites; per::Bool = false)
+    H_even, H_odd = even_odd_Hamiltonian(hj, sites; per = per)
     # TEBD gate layers for 2nd-order Suzuki–Trotter:
     U_even(tau) = exp.(-im*(tau) * H_even)
     U_odd(tau)  = exp.(-im*(tau) * H_odd )
@@ -319,8 +350,8 @@ PF3_gate(U_a, U_b, τ::Real) = vcat(
     U_a((-1/24)*τ), U_b(τ),
 )
 
-function PF_gate(hj, sites, τ::Real; order::Int = 1)
-    U_even, U_odd = time_operators_even_odd(hj, sites)
+function PF_gate(hj, sites, τ::Real; order::Int = 1, per::Bool = false)
+    U_even, U_odd = time_operators_even_odd(hj, sites; per = per)
     
     if     order == 1
         return PF1_gate(U_even, U_odd, τ)
@@ -341,6 +372,36 @@ function _bond_endpoint(r::Int, N::Int; per::Bool = false)
         return 1
     end
     throw(ArgumentError("bond index r=$r is outside the open chain 1:$(N - 1)"))
+end
+
+function _bond_sites(r::Int, N::Int; per::Bool = false)
+    if 1 <= r < N
+        return (r, r + 1)
+    elseif r == N && per
+        return (N, 1)
+    end
+    return ()
+end
+
+function _overlaps_sites(a, b)
+    for x in a, y in b
+        x == y && return true
+    end
+    return false
+end
+
+function _is_contiguous_sites(site_numbers)
+    isempty(site_numbers) && return false
+    first_site, last_site = first(site_numbers), last(site_numbers)
+    return site_numbers == collect(first_site:last_site)
+end
+
+function _mpo_to_itensor(O::MPO)
+    T = ITensor(1.0)
+    for j in 1:length(O)
+        T *= O[j]
+    end
+    return T
 end
 
 
@@ -381,18 +442,51 @@ function discrete_spin_current_density_operators(
     N = length(sites)
     selected_bonds = bonds === nothing ? (per ? collect(1:N) : collect(1:(N - 1))) : collect(bonds)
 
-    j_odd = [
-        discrete_odd_spin_current_density_mpo(r, sites, J; per = per)
-        for r in selected_bonds
-    ]
+    even_bonds, _ = even_odd_bonds(N; per = per)
+    length(Ue_gates) == length(even_bonds) ||
+        throw(ArgumentError("Ue_gates length must match the even bond layer"))
 
-    Ue_dag = swapprime.(dag.(Ue_gates),0,1)
-    j_even = [
-        apply(Ue_dag, jr; cutoff = cutoff, maxdim = maxdim, apply_dag = true)
-        for jr in j_odd
-    ]
+    Ue_dag = swapprime.(dag.(Ue_gates), 0, 1)
+    even_gate_sites = [_bond_sites(r, N; per = per) for r in even_bonds]
 
-    return (odd = j_odd, even = j_even, bonds = selected_bonds)
+    j_odd = Vector{ITensor}(undef, length(selected_bonds))
+    j_even = Vector{ITensor}(undef, length(selected_bonds))
+    odd_sites = Vector{Vector{Int}}(undef, length(selected_bonds))
+    even_sites = Vector{Vector{Int}}(undef, length(selected_bonds))
+
+    for (i, r) in enumerate(selected_bonds)
+        current_sites = collect(_bond_sites(r, N; per = per))
+        isempty(current_sites) && throw(ArgumentError("current bond $r has empty support"))
+
+        j_odd[i] = discrete_odd_spin_current_density(r, sites, J; per = per)
+        odd_sites[i] = current_sites
+
+        local_gates = ITensor[]
+        support_sites = copy(current_sites)
+
+        for (gate_sites, gate) in zip(even_gate_sites, Ue_dag)
+            if _overlaps_sites(current_sites, gate_sites)
+                push!(local_gates, gate)
+                append!(support_sites, gate_sites)
+            end
+        end
+
+        sort!(unique!(support_sites))
+        _is_contiguous_sites(support_sites) ||
+            throw(ArgumentError("current support must be contiguous; periodic wraparound currents are not supported here"))
+
+        local_sites = sites[first(support_sites):last(support_sites)]
+        local_r = r - first(support_sites) + 1
+        local_odd = discrete_odd_spin_current_density_mpo(local_r, local_sites, J; per = false)
+        local_even = isempty(local_gates) ?
+            local_odd :
+            apply(local_gates, local_odd; cutoff = cutoff, maxdim = maxdim, apply_dag = true)
+
+        j_even[i] = _mpo_to_itensor(local_even)
+        even_sites[i] = support_sites
+    end
+
+    return (odd = j_odd, even = j_even, odd_sites = odd_sites, even_sites = even_sites, bonds = selected_bonds)
 end
 
 
@@ -407,7 +501,7 @@ end
 function step(rho::MPO, gate; cutoff=1e-10, maxdim=nothing, hermitianize::Bool = false, normalize::Bool = true)
     rho = apply(gate, rho; cutoff=cutoff, maxdim=maxdim, apply_dag=true)
     if hermitianize
-        hermitianize!(rho, normalize = normalize)
+        hermitianize!(rho; cutoff = cutoff, normalize = normalize)
     elseif normalize
         _normalize!(rho)
     end
@@ -499,7 +593,75 @@ function _expect(psi::MPS, opname::String = "Sz")
     
     return expect(psi, opname; sites = 1:N)
 end
-_expect(rho::MPO, opname::String = "Sz") = local_expect_mpo(rho, opname)
+_expect(rho::MPO, opname::String = "Sz"; normalize::Bool = true) = local_expect_mpo(rho, opname; normalize = normalize)
+
+function _expect_operators(psi::MPS, ops; cutoff = 1e-10, maxdim = nothing, normalize::Bool = true, hermitian::Bool = false)
+    vals = Vector{ComplexF64}(undef, length(ops))
+    Z = normalize ? inner(psi, psi) : one(ComplexF64)
+
+    for (i, O) in enumerate(ops)
+        vals[i] = inner(psi, O, psi) / Z
+    end
+
+    return vals
+end
+
+function _expect_operators(rho::MPO, ops; cutoff = 1e-10, maxdim = nothing, normalize::Bool = true, hermitian::Bool = false)
+    vals = Vector{ComplexF64}(undef, length(ops))
+    Z = normalize ? tr(rho) : one(ComplexF64)
+
+    for (i, O) in enumerate(ops)
+        # Equivalent to tr(apply(O, rho)), but avoids materializing O * rho.
+        vals[i] = inner(hermitian ? O : hermitian_mpo(O), rho) / Z
+    end
+
+    return vals
+end
+
+function _expect_local_operators(rho::MPO, ops, supports; normalize::Bool = true)
+    N = length(rho)
+    length(ops) == length(supports) ||
+        throw(DimensionMismatch("number of local operators and supports must match"))
+
+    s  = [siteind(rho, j; plev = 0) for j in 1:N]
+    sp = [siteind(rho, j; plev = 1) for j in 1:N]
+
+    Ttr = Vector{ITensor}(undef, N)
+    for j in 1:N
+        Ttr[j] = rho[j] * delta(dag(s[j]), dag(sp[j]))
+    end
+
+    left_env = Vector{ITensor}(undef, N + 1)
+    right_env = Vector{ITensor}(undef, N + 1)
+    left_env[1] = ITensor(1.0)
+    right_env[N + 1] = ITensor(1.0)
+
+    for j in 1:N
+        left_env[j + 1] = left_env[j] * Ttr[j]
+    end
+    for j in N:-1:1
+        right_env[j] = Ttr[j] * right_env[j + 1]
+    end
+
+    Z = scalar(left_env[N + 1])
+    invZ = normalize ? inv(Z) : one(Z)
+    vals = Vector{ComplexF64}(undef, length(ops))
+
+    for i in eachindex(ops)
+        support = supports[i]
+        _is_contiguous_sites(support) ||
+            throw(ArgumentError("local operator support must be contiguous"))
+
+        first_site, last_site = first(support), last(support)
+        T = left_env[first_site]
+        for j in first_site:last_site
+            T *= rho[j]
+        end
+        vals[i] = scalar(T * dag(ops[i]) * right_env[last_site + 1]) * invZ
+    end
+
+    return vals
+end
 
 _Entropy_Bipartition(psi::MPS, b::Int; base = 2, tol = 1e-20) = Entropy_Bipartition(psi, b; base = base, tol = tol)
 _Entropy_Bipartition(rho::MPO, b; base = 2)                   = second_Renyi_entropy(rho, b; base = base)
@@ -530,14 +692,14 @@ function state_evo(
         f_hamiltonian = heis_rf_for_h(h; per = per) # each h[i] ∈ [-W, W] ts
     end
     
-    gate = PF_gate(f_hamiltonian, s, tau; order = 1)
+    gate = PF_gate(f_hamiltonian, s, tau; order = 1, per = per)
 
     nt = length(t_Vec)
     N = length(s)
     c = div(N, 2)
 
     psi_vec = store_states ? Vector{typeof(psi)}(undef, nt) : Vector{typeof(psi)}()
-    Sz_all = Matrix{Float64}(undef, nt, N)
+
     S_Bi = Vector{Float64}(undef, nt)
     psi_t = deepcopy(psi)
 
@@ -575,59 +737,6 @@ function state_evo(
 end
 
 
-function complete_state_evo(
-    s,
-    psi,
-    t_Vec,
-    r;
-    h::Union{Nothing,AbstractVector}=nothing,
-    per::Bool=false,
-    cutoff::Real=1e-10,
-    showprogress::Bool=true,
-    hermitianize::Bool=false,
-    normalize_every::Int=1,
-)
-
-    normalize_every < 1 && throw(ArgumentError("normalize_every must be >= 1"))
-
-    tau =  (t_Vec[end] - t_Vec[1]) / r
-
-    if h === nothing || all(isnothing, h)
-        f_hamiltonian = heis_hj_no_h(; per = per)
-    else
-        f_hamiltonian = heis_rf_for_h(h; per = per)
-    end
-
-    gate = PF_gate(f_hamiltonian, s, tau; order = 1)
-
-    nt = length(t_Vec)
-    psi_vec = Vector{typeof(psi)}(undef, nt)
-    psi_t = deepcopy(psi)
-
-    p = showprogress ? Progress(nt; desc="Full state evo (r=$r)", dt=0.2) : nothing
-
-    for i in 1:nt
-        psi_vec[i] = copy(psi_t)
-
-        if i < nt
-            do_normalize = (normalize_every == 1) || (i % normalize_every == 0) || (i == nt - 1)
-            do_hermitianize = hermitianize && do_normalize
-            psi_t = step(
-                psi_t,
-                gate;
-                cutoff=cutoff,
-                hermitianize=do_hermitianize,
-                normalize=do_normalize,
-            )
-        end
-
-        showprogress && next!(p)
-    end
-
-    return psi_vec
-end
-
-
 function Diff_trotter_r(
     s,
     psi,
@@ -652,7 +761,7 @@ function Diff_trotter_r(
         ts = collect(range(0.0, t; length=r+1))
 
         if doprint == true 
-            print_simulation_parameters(N, tau, cutoff, t, r)
+            print_simulation_parameters(N, cutoff, t, r)
         end
         All_Full_evos[ir] = state_evo(
             s,
@@ -677,11 +786,11 @@ end
 # ========================================= #
 
 
-function print_simulation_parameters(N, tau, cutoff, t, r)
+function print_simulation_parameters(N, cutoff, t, r)
     println("=============== Simulation Parameters ===============")
     @printf("   %-6s = %-12d  # Number of sites\n", "N", N)
     @printf("   %-6s = %-12d  # Number of Trotter steps\n", "r", r)
-    @printf("   %-6s = %-12g  # Trotter step\n", "τ", tau)
+    @printf("   %-6s = %-12g  # Trotter step\n", "τ", t/r)
     @printf("   %-6s = %-12g  # Total simulation time\n", "t", t)
     @printf("   %-6s = %-12.1e # Singular value cutoff\n", "cutoff", cutoff)
     println("=====================================================")
@@ -838,6 +947,231 @@ end
 
 
 # ========================================= #
+# ======= Complete stable evolution ======= #
+# ========================================= #
+
+function hermitianize_stable(rho::MPO; cutoff=1e-10, normalize::Bool = false)
+    rhoH = hermitian_mpo(rho)
+    rho_hermitian = 0.5 * add(rho, rhoH; cutoff=cutoff)
+    if normalize
+        normalize!(rho_hermitian)
+    end
+    return rho_hermitian
+end
+
+function hermitianize_stable!(rho::MPO; cutoff=1e-10, normalize::Bool = false)
+    rho .= hermitianize_stable(rho; cutoff=cutoff, normalize = normalize)
+    return rho
+end
+
+function step_stable(rho::MPO, gate; cutoff=1e-10, maxdim=nothing, hermitianize::Bool = false, normalize::Bool = true)
+    rho = apply(gate, rho; cutoff=cutoff, maxdim=maxdim, apply_dag=true)
+    if hermitianize
+        hermitianize_stable!(rho; cutoff = cutoff, normalize = normalize)
+    elseif normalize
+        normalize!(rho)
+    end
+    return rho
+end
+
+function complete_state_evo(
+    s,
+    psi,
+    t_Vec,
+    r;
+    h::Union{Nothing,AbstractVector}=nothing,
+    per::Bool=false,
+    cutoff = 1e-10,
+    maxdim = nothing,
+    showprogress::Bool=true,
+    hermitianize::Bool=false,
+    normalize_every::Int=1,
+)
+
+    normalize_every < 1 && throw(ArgumentError("normalize_every must be >= 1"))
+
+    tau =  (t_Vec[end] - t_Vec[1]) / r
+
+    if h === nothing || all(isnothing, h)
+        f_hamiltonian = heis_hj_no_h(; per = per, J=pi/2)
+    else
+        f_hamiltonian = heis_rf_for_h(h; per = per)
+    end
+
+    gate = PF_gate(f_hamiltonian, s, tau; order = 1, per = per)
+
+    nt = length(t_Vec)
+    psi_vec = Vector{typeof(psi)}(undef, nt)
+    psi_t = deepcopy(psi)
+    normalize!(psi_t)
+
+    p = showprogress ? Progress(nt; desc="Full state evo (r=$r)", dt=0.2) : nothing
+
+    for i in 1:nt
+        psi_vec[i] = copy(psi_t)
+
+        if i < nt
+            do_normalize = (normalize_every == 1) || (i % normalize_every == 0) || (i == nt - 1)
+            do_hermitianize = hermitianize && do_normalize
+            psi_t = step_stable(
+                psi_t,
+                gate;
+                cutoff=cutoff,
+                maxdim = maxdim,
+                hermitianize=do_hermitianize,
+                normalize=do_normalize,
+            )
+        end
+
+        showprogress && next!(p)
+    end
+
+    return psi_vec
+end
+
+function avg_state_evo(
+    s,
+    psi,
+    t_Vec,
+    r;
+    h::Union{Nothing,AbstractVector}=nothing,
+    per::Bool=false,
+    cutoff = 1e-10,
+    maxdim = nothing,
+    showprogress::Bool=true,
+    hermitianize::Bool=false,
+    normalize_every::Int=1,
+    expect_every::Int=1,
+    J::Real = pi*0.5,
+    measure_currents::Bool=false,
+    current_operators = nothing,
+    current_bonds = nothing,
+    current_kind::Symbol = :both,
+    current_cutoff = cutoff,
+    current_maxdim = maxdim,
+)
+
+    normalize_every < 1 && throw(ArgumentError("normalize_every must be >= 1"))
+    expect_every < 1 && throw(ArgumentError("expect_every must be >= 1"))
+    current_kind in (:odd, :even, :both) || throw(ArgumentError("current_kind must be :odd, :even, or :both"))
+
+    tau =  (t_Vec[end] - t_Vec[1]) / r
+
+    if h === nothing || all(isnothing, h)
+        f_hamiltonian = heis_hj_no_h(; per = per, J = J)
+    else
+        f_hamiltonian = heis_rf_for_h(h; per = per, J = J)
+    end
+
+    gate = PF_gate(f_hamiltonian, s, tau; order = 1, per = per)
+    do_currents = measure_currents || current_operators !== nothing
+    current_ops = nothing
+
+    if do_currents
+        if current_operators === nothing
+            U_even, _ = time_operators_even_odd(f_hamiltonian, s; per = per)
+            current_ops = discrete_spin_current_density_operators(
+                s,
+                J,
+                U_even(tau / 2);
+                bonds = current_bonds,
+                per = per,
+                cutoff = current_cutoff,
+                maxdim = current_maxdim,
+            )
+        else
+            current_ops = current_operators
+        end
+    end
+
+    nt = length(t_Vec)
+    N = length(s)
+    expect_steps = [i for i in 1:nt if (i == 1) || (i == nt) || ((i - 1) % expect_every == 0)]
+    expect_ts = collect(t_Vec[expect_steps])
+    Sz_all = Matrix{Float64}(undef, length(expect_steps), N)
+    J_odd_all = nothing
+    J_even_all = nothing
+
+    if do_currents
+        nbonds = length(current_ops.bonds)
+        if current_kind in (:odd, :both)
+            J_odd_all = Matrix{Float64}(undef, length(expect_steps), nbonds)
+        end
+        if current_kind in (:even, :both)
+            J_even_all = Matrix{Float64}(undef, length(expect_steps), nbonds)
+        end
+    end
+
+    psi_t = deepcopy(psi)
+    normalize!(psi_t)
+
+    p = showprogress ? Progress(nt; desc="Avg state evo (r=$r)", dt=0.2) : nothing
+    expect_count = 0
+
+    for i in 1:nt
+        do_expect = expect_count < length(expect_steps) && i == expect_steps[expect_count + 1]
+        if do_expect
+            expect_count += 1
+            Sz_all[expect_count, :] = real.(_expect(psi_t, "Sz"))
+            if do_currents
+                if J_odd_all !== nothing
+                    J_odd_all[expect_count, :] = real.(
+                        hasproperty(current_ops, :odd_sites) ?
+                        _expect_local_operators(psi_t, current_ops.odd, current_ops.odd_sites) :
+                        _expect_operators(
+                            psi_t,
+                            current_ops.odd;
+                            hermitian = true,
+                            cutoff = current_cutoff,
+                            maxdim = current_maxdim,
+                        )
+                    )
+                end
+                if J_even_all !== nothing
+                    J_even_all[expect_count, :] = real.(
+                        hasproperty(current_ops, :even_sites) ?
+                        _expect_local_operators(psi_t, current_ops.even, current_ops.even_sites) :
+                        _expect_operators(
+                            psi_t,
+                            current_ops.even;
+                            hermitian = true,
+                            cutoff = current_cutoff,
+                            maxdim = current_maxdim,
+                        )
+                    )
+                end
+            end
+        end
+
+        if i < nt
+            do_normalize = (normalize_every == 1) || (i % normalize_every == 0) || (i == nt - 1)
+            do_hermitianize = hermitianize && do_normalize
+            psi_t = step_stable(
+                psi_t,
+                gate;
+                cutoff=cutoff,
+                maxdim = maxdim,
+                hermitianize=do_hermitianize,
+                normalize=do_normalize,
+            )
+        end
+
+        showprogress && next!(p)
+    end
+
+    if do_currents
+        currents = (bonds = current_ops.bonds, odd = J_odd_all, even = J_even_all)
+        return Sz_all, expect_ts, currents
+    end
+
+    return Sz_all, expect_ts
+end
+
+
+
+
+
+# ========================================= #
 # ============ Final functions ============ #
 # ========================================= #
 
@@ -896,6 +1230,276 @@ function state_evo_parameters(s, MPS_vec; showprogress::Bool = true)
     return (MPS_vec, Sz_all, S_Bi)
 end
 
+const EVOLUTION_DIR = joinpath(pwd(), "evolution_files")
+
+function _evolution_filepath(filename)
+    return isabspath(filename) ? filename : joinpath(EVOLUTION_DIR, filename)
+end
+
+function _write_hdf5_params(parent, params, reserved)
+    for (key, val) in params
+        key = string(key)
+        if key in reserved
+            @warn "Skipping reserved HDF5 metadata key" key
+        else
+            write(parent, key, val)
+        end
+    end
+end
+
+function save_avg_state_evo(filename, avg_result::Tuple; params=Dict())
+    if length(avg_result) == 2
+        Sz_all, expect_ts = avg_result
+        return save_avg_state_evo(filename, Sz_all, expect_ts; params = params)
+    elseif length(avg_result) == 3
+        Sz_all, expect_ts, currents = avg_result
+        return save_avg_state_evo(filename, Sz_all, expect_ts; currents = currents, params = params)
+    end
+
+    throw(ArgumentError("avg_result must be the 2- or 3-value tuple returned by avg_state_evo"))
+end
+
+function save_avg_state_evo(
+    filename,
+    Sz_all,
+    expect_ts;
+    currents = nothing,
+    params = Dict(),
+)
+    mkpath(EVOLUTION_DIR)
+    filepath = _evolution_filepath(filename)
+    mkpath(dirname(filepath))
+
+    nexpect, N = size(Sz_all)
+    length(expect_ts) == nexpect ||
+        throw(ArgumentError("length(expect_ts) must match size(Sz_all, 1)"))
+
+    h5open(filepath, "w") do f
+        write(f, "format", "avg_state_evo_v1")
+        write(f, "Sz_all", Sz_all)
+        write(f, "expect_ts", expect_ts)
+        write(f, "nexpect", nexpect)
+        write(f, "N", N)
+        write(f, "has_currents", currents !== nothing)
+
+        reserved = Set(["format", "Sz_all", "expect_ts", "nexpect", "N", "has_currents", "currents"])
+        _write_hdf5_params(f, params, reserved)
+
+        if currents !== nothing
+            g = create_group(f, "currents")
+            write(g, "bonds", currents.bonds)
+
+            if currents.odd !== nothing
+                size(currents.odd, 1) == nexpect ||
+                    throw(ArgumentError("size(currents.odd, 1) must match length(expect_ts)"))
+                size(currents.odd, 2) == length(currents.bonds) ||
+                    throw(ArgumentError("size(currents.odd, 2) must match length(currents.bonds)"))
+                write(g, "odd", currents.odd)
+            end
+
+            if currents.even !== nothing
+                size(currents.even, 1) == nexpect ||
+                    throw(ArgumentError("size(currents.even, 1) must match length(expect_ts)"))
+                size(currents.even, 2) == length(currents.bonds) ||
+                    throw(ArgumentError("size(currents.even, 2) must match length(currents.bonds)"))
+                write(g, "even", currents.even)
+            end
+        end
+    end
+
+    println("Saved avg_state_evo values to: $filepath")
+    return filepath
+end
+
+function load_avg_state_evo(filename)
+    filepath = _evolution_filepath(filename)
+
+    h5open(filepath, "r") do f
+        Sz_all = read(f, "Sz_all")
+        expect_ts = read(f, "expect_ts")
+        has_currents = haskey(f, "has_currents") ? read(f, "has_currents") : haskey(f, "currents")
+
+        if has_currents
+            g = f["currents"]
+            bonds = read(g, "bonds")
+            odd = haskey(g, "odd") ? read(g, "odd") : nothing
+            even = haskey(g, "even") ? read(g, "even") : nothing
+            currents = (bonds = bonds, odd = odd, even = even)
+            return Sz_all, expect_ts, currents
+        end
+
+        return Sz_all, expect_ts
+    end
+end
+
+function save_state_evolution(filename, states, ts; params=Dict())
+    mkpath(EVOLUTION_DIR)
+
+    filepath = _evolution_filepath(filename)
+
+    h5open(filepath, "w") do f
+        write(f, "ts", ts)
+        write(f, "nsteps", length(states))
+
+        for (key, val) in params
+            write(f, string(key), val)
+        end
+
+        p = Progress(length(states); desc="Saving states", dt=0.5)
+
+        for n in eachindex(states)
+            write(f, "state_$n", states[n])
+            next!(p)
+        end
+    end
+
+    println("Saved evolution to: $filepath")
+    return filepath
+end
+
+function save_complete_state_evolution(
+    filename,
+    s,
+    psi,
+    t_Vec,
+    r;
+    h::Union{Nothing,AbstractVector}=nothing,
+    per::Bool=false,
+    cutoff=1e-10,
+    maxdim=nothing,
+    showprogress::Bool=true,
+    hermitianize::Bool=false,
+    normalize_every::Int=1,
+    save_every::Int=1,
+    normalize_saved::Bool=false,
+    params=Dict(),
+)
+    normalize_every < 1 && throw(ArgumentError("normalize_every must be >= 1"))
+    save_every < 1 && throw(ArgumentError("save_every must be >= 1"))
+
+    mkpath(EVOLUTION_DIR)
+    filepath = joinpath(EVOLUTION_DIR, filename)
+
+    tau = (t_Vec[end] - t_Vec[1]) / r
+
+    if h === nothing || all(isnothing, h)
+        f_hamiltonian = heis_hj_no_h(; per=per, J=pi/2)
+    else
+        f_hamiltonian = heis_rf_for_h(h; per=per)
+    end
+
+    gate = PF_gate(f_hamiltonian, s, tau; order=1, per=per)
+
+    nt = length(t_Vec)
+    psi_t = deepcopy(psi)
+    normalize!(psi_t)
+
+    saved_steps = Int[]
+    saved_count = 0
+
+    h5open(filepath, "w") do f
+        write(f, "ts", t_Vec)
+
+        metadata = Dict{String,Any}(
+            "r" => r,
+            "save_every" => save_every,
+        )
+        for (key, val) in params
+            key = string(key)
+            if key in ("ts", "nsteps", "saved_steps", "saved_ts")
+                @warn "Skipping reserved HDF5 metadata key" key
+            else
+                metadata[key] = val
+            end
+        end
+
+        for (key, val) in metadata
+            write(f, key, val)
+        end
+
+        p = showprogress ? Progress(nt; desc="Evolve/save state (r=$r)", dt=0.5) : nothing
+
+        for i in 1:nt
+            do_save = (i == 1) || (i == nt) || ((i - 1) % save_every == 0)
+            if do_save
+                saved_count += 1
+                push!(saved_steps, i)
+
+                if normalize_saved
+                    psi_save = deepcopy(psi_t)
+                    _normalize!(psi_save)
+                    write(f, "state_$saved_count", psi_save)
+                else
+                    write(f, "state_$saved_count", psi_t)
+                end
+            end
+
+            if i < nt
+                do_normalize = (normalize_every == 1) || (i % normalize_every == 0) || (i == nt - 1)
+                do_hermitianize = hermitianize && do_normalize
+                psi_t = step_stable(
+                    psi_t,
+                    gate;
+                    cutoff=cutoff,
+                    maxdim=maxdim,
+                    hermitianize=do_hermitianize,
+                    normalize=do_normalize,
+                )
+            end
+
+            showprogress && next!(p)
+        end
+
+        write(f, "nsteps", saved_count)
+        write(f, "saved_steps", saved_steps)
+        write(f, "saved_ts", t_Vec[saved_steps])
+    end
+
+    println("Saved evolution to: $filepath")
+    return filepath
+end
+
+function load_mpo_evolution(
+    filename;
+    showprogress::Bool=true,
+    progress_dt::Real=0.5,
+    state_indices=nothing,
+)
+    filepath = joinpath(EVOLUTION_DIR, filename)
+
+    if showprogress
+        println("Opening evolution file: $filepath")
+        flush(stdout)
+    end
+
+    h5open(filepath, "r") do f
+        ts = haskey(f, "saved_ts") ? read(f, "saved_ts") : read(f, "ts")
+        nsteps = read(f, "nsteps")
+
+        load_indices = state_indices === nothing ? collect(1:nsteps) : collect(state_indices)
+        any(i -> i < 1 || i > nsteps, load_indices) &&
+            throw(ArgumentError("state_indices must be in 1:$nsteps"))
+
+        if showprogress
+            println("Loading $(length(load_indices)) saved MPO state(s). The first read may take a while.")
+            flush(stdout)
+        end
+
+        states = Vector{MPO}(undef, length(load_indices))
+
+        p = showprogress ? Progress(length(load_indices); desc="Loading states", dt=progress_dt) : nothing
+        showprogress && update!(p, 0)
+
+        for (i, n) in enumerate(load_indices)
+            states[i] = read(f, "state_$n", MPO)
+            showprogress && next!(p)
+        end
+
+        showprogress && finish!(p)
+
+        return states, ts[load_indices]
+    end
+end
 
 
 nothing
