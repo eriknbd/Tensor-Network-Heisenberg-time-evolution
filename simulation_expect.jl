@@ -4,20 +4,20 @@ Pkg.activate()
 include("module/new_att.jl")
 
 # =============== Initial Mixed State ============== #
-N = 7200
-μ = 0.0005
+N = 1400
+μ = 0.001
 ρ0, sites = initial_rho_mu(N, μ; normalize=true, conserve_qns=true)
 println("Initial state created.")
 
 # ============== State Evolution ============= #
-t = 3600 # total time of the Evolution
-r = 3600
-cutoff = 1e-8
-maxdim = 256
-expect_every = 1
+t = 600 # total time of the Evolution
+r = t*10
+cutoff = 1e-10
+maxdim = 400
+expect_every = 10
 ts = collect(range(0.0, t; length=r+1))
 h = [nothing] # h vector
-J = pi * 0.5
+J = 1
 current_kind = :both
 current_bonds = nothing
 
